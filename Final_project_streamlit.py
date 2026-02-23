@@ -99,7 +99,6 @@ CITY_COORDINATES = {
     'גדרה': [31.8125, 34.7780],
 }
 
-
 # ==========================================
 # DATA PIPELINE FUNCTIONS
 # ==========================================
@@ -493,8 +492,9 @@ def determine_majority_religion(df):
 
 @st.cache_data(show_spinner=False)
 def load_cloud_ready_data(crime_path, cpi_path):
+    # This prevents the cloud from trying to run the pipeline if files are missing
     if not os.path.exists(crime_path) or not os.path.exists(cpi_path):
-        run_data_pipeline(crime_path, cpi_path)
+        return None, None
         
     df = pd.read_csv(crime_path, low_memory=False, compression='gzip')
     try:
@@ -982,11 +982,13 @@ if __name__ == "__main__":
     final_crime_path = "merged_crime_population_final.csv.gz"
     cpi_path = "quarterly_cpi_chained.csv"
 
-    try:
+    if st.runtime.exists():
+        # Running inside Streamlit Cloud
         if not os.path.exists(final_crime_path) or not os.path.exists(cpi_path):
-            st.info("⚠️ Generated CSVs not found locally. Initiating automated Data Pipeline... (This may take memory & time)")
-            st.warning("💡 Hint: If the app crashes shortly after this, the cloud server likely ran out of RAM. Best fix: Run the script on your PC and upload the generated CSV files directly to GitHub.")
-        
+            st.error("🚨 Missing Data Files!")
+            st.warning("The cloud server does not have enough memory to download and process 6 years of raw API data from scratch. \n\n**To fix this:**\n1. Run this script locally on your computer's terminal.\n2. When prompted, type 'y' to generate the data files.\n3. Upload the created `merged_crime_population_final.csv.gz` and `quarterly_cpi_chained.csv` files to your GitHub repository.")
+            st.stop() # Prevents the app from running the heavy pipeline and crashing
+            
         with st.spinner("Loading and processing dashboard data..."):
             df, cpi_df = load_cloud_ready_data(final_crime_path, cpi_path)
             
@@ -995,6 +997,15 @@ if __name__ == "__main__":
         else:
             st.error("Dashboard could not load because the dataset is empty or failed to process.")
 
-    except Exception as e:
-        st.error(f"An unexpected error occurred while loading the app: {e}")
-        st.info("Please make sure all dependencies in your `requirements.txt` are installed.")
+    else:
+        # Running locally in terminal
+        print("------------------------------------------------------------------")
+        print("⚠️  STREAMLIT NOT DETECTED")
+        print("   To view the interactive dashboard, run this script via Streamlit CLI:")
+        print(f"   $ streamlit run {os.path.basename(__file__) if '__file__' in locals() else 'crime_visualization.py'}")
+        print("\n   [Optional] Do you want to run the background Data Pipeline anyway? (Downloading APIs, merging, cleaning)")
+        user_input = input("   Type 'y' to run pipeline, or 'n' to exit: ").strip().lower()
+        if user_input == 'y':
+            run_data_pipeline(final_crime_path, cpi_path)
+        print("------------------------------------------------------------------")
+        
