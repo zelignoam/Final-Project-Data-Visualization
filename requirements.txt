@@ -1,7 +1,7 @@
-streamlit
+streamlit==1.40.0
 pandas
-numpy
 plotly
-scikit-learn
+pydeck
+numpy
 requests
-matplotlib
+statsmodels
