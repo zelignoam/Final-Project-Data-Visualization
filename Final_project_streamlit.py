@@ -261,17 +261,15 @@ def process_and_summarize_crime_data(df):
     for child, parent in remaining_steps:
         df_processed = impute_parent_from_child(df_processed, child, parent)
 
-    df_processed['QuarterYear']= df_processed['Quarter'] +'-'+ df_processed['Year'].astype(str)
-    
-    group_cols = ['Year', 'Quarter', 'QuarterYear', 'Yeshuv', 'YeshuvKod',
-                  'PoliceDistrict', 'PoliceMerhav', 'municipalName', 
-                  'StatisticArea', 'StatisticGroup', 'StatisticType']
+    # REMOVED granular columns like StatisticArea, PoliceStation, PoliceDistrict to severely shrink file size
+    group_cols = ['Year', 'Quarter', 'Yeshuv', 'YeshuvKod', 'StatisticGroup', 'StatisticType']
     valid_group_cols = [c for c in group_cols if c in df_processed.columns]
     
     df_for_agg = df_processed.copy()
     for col in valid_group_cols:
         df_for_agg[col] = df_for_agg[col].fillna('Missing')
     
+    # Aggregate data to significantly shrink the row count
     summary_df = df_for_agg.groupby(valid_group_cols)['FictiveIDNumber'].count().reset_index()
     summary_df.rename(columns={'FictiveIDNumber': 'EventCount'}, inplace=True)
     return summary_df, df_processed
@@ -474,10 +472,6 @@ def run_data_pipeline(final_crime_path, cpi_path):
 # ==========================================
 
 def determine_majority_religion(df):
-    """
-    Attempts to determine the majority religion per row based on exact column names provided.
-    Includes mapping to English for uniform UI presentation.
-    """
     potential_cols = ['Jews_and_Others', 'Arabs', 'יהודים ואחרים', 'ערבים']
     existing_cols = [col for col in potential_cols if col in df.columns]
     
@@ -499,15 +493,9 @@ def determine_majority_religion(df):
 
 @st.cache_data(show_spinner=False)
 def load_cloud_ready_data(crime_path, cpi_path):
-    """
-    Cloud-optimized data loader. 
-    Checks if files exist. If yes, loads them. 
-    If no, safely executes the pipeline, caches the result in memory, and saves locally.
-    """
     if not os.path.exists(crime_path) or not os.path.exists(cpi_path):
         run_data_pipeline(crime_path, cpi_path)
         
-    # Pandas natively handles '.gz' compression automatically!
     df = pd.read_csv(crime_path, low_memory=False, compression='gzip')
     try:
         cpi_df = pd.read_csv(cpi_path)
@@ -517,27 +505,24 @@ def load_cloud_ready_data(crime_path, cpi_path):
     return df, cpi_df
 
 def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
-    # Removed st.set_page_config from here!
     st.title("🛡️ Israel Crime Analysis")
 
     # --- Create a distinct and large pastel color palette so colors never repeat ---
     DISTINCT_COLORS = px.colors.qualitative.Pastel + px.colors.qualitative.Set3 + px.colors.qualitative.Pastel1 + px.colors.qualitative.Pastel2
 
     # --- 1. Data Preprocessing ---
-    # Strip column names of hidden whitespaces
     merged_df.columns = merged_df.columns.str.strip()
     
     valid_years = [2020, 2021, 2022, 2023]
     df_clean = merged_df[merged_df['Year'].isin(valid_years)].copy()
     
-    # Filter out "שגיאת הזנה" (Input Error)
     df_clean = df_clean[df_clean['StatisticGroup'] != 'שגיאת הזנה']
     
     df_clean['EventCount'] = pd.to_numeric(df_clean['EventCount'], errors='coerce').fillna(0)
     df_clean['Total_Population'] = pd.to_numeric(df_clean['Total_Population'], errors='coerce')
     df_clean = determine_majority_religion(df_clean)
 
-    # --- 2. SIDEBAR FILTERS (All Dropdowns) ---
+    # --- 2. SIDEBAR FILTERS ---
     st.sidebar.header("Global Data Filters")
     st.sidebar.markdown("Changes here affect all visualizations.")
 
@@ -684,7 +669,7 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
 
     st.markdown("---")
 
-    # --- 3. CHANGE IN DISTRIBUTION OVER TIME (Absolute Volume + Percentage inside) ---
+    # --- 3. CHANGE IN DISTRIBUTION OVER TIME ---
     st.header("3. 📈 Crime Volume & Distribution Over Time - the share of crimes against property is increasing with time")
     st.markdown("Displays the absolute number of crimes per quarter, with internal segments representing the percentage of each crime type. There's no internal annual trend of quarters/seasons.")
     if 'Quarter' in df_filtered.columns:
@@ -693,10 +678,7 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
         q1_total = q1_df.groupby('YearQuarter')['EventCount'].transform('sum')
         q1_df['Percent'] = (q1_df['EventCount'] / q1_total) * 100
         
-        # Determine global sort order (Largest volume at the bottom of the stack)
         cat_order = q1_df.groupby('StatisticGroup')['EventCount'].sum().sort_values(ascending=False).index.tolist()
-        
-        # Add a text label, hide text for tiny segments to avoid cluttering the visual
         q1_df['TextLabel'] = q1_df['Percent'].apply(lambda x: f"{x:.0f}%" if x >= 3 else "")
 
         fig_q1 = px.bar(
@@ -704,7 +686,7 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
             title="Absolute Crime Volume with Relative Distribution",
             labels={'YearQuarter': 'Quarter', 'EventCount': 'Total Crimes (Absolute)', 'StatisticGroup': 'Crime Type'},
             text='TextLabel',
-            category_orders={'StatisticGroup': cat_order}, # Ensures largest segments are at the bottom
+            category_orders={'StatisticGroup': cat_order},
             color_discrete_sequence=DISTINCT_COLORS
         )
         fig_q1.update_traces(textposition='inside', textfont_size=12)
@@ -718,14 +700,12 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
     if cpi_df is not None and not cpi_df.empty:
         cpi_df.columns = cpi_df.columns.str.strip()
         
-        # Group crime by Quarter and StatisticGroup
         q4_df = df_clean.groupby(['Year', 'Quarter', 'StatisticGroup'])['EventCount'].sum().reset_index()
         q4_df['YearQuarter'] = q4_df['Year'].astype(str) + q4_df['Quarter']
         
         q4_pivot = q4_df.pivot(index='YearQuarter', columns='StatisticGroup', values='EventCount').fillna(0)
         q4_pct = q4_pivot.div(q4_pivot.sum(axis=1), axis=0) * 100
         
-        # Look for the 'Property' / 'רכוש' column
         prop_cols = [c for c in q4_pct.columns if 'רכוש' in str(c) or 'Property' in str(c)]
         
         if prop_cols and 'quarter_name' in cpi_df.columns and 'avg_chained_index_points' in cpi_df.columns:
@@ -749,29 +729,24 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
             x_vals = cat_data['avg_chained_index_points']
             y_vals = cat_data[col_name]
             
-            # 1. Add Scatter Points
             fig_q4.add_trace(go.Scatter(
                 x=x_vals, y=y_vals, mode='markers', name='Property Crimes',
                 marker=dict(color='royalblue', size=10)
             ))
             
-            # 2. Add Regression Line & Confidence Interval if statsmodels is available
             if has_sm:
                 X_sm = sm.add_constant(x_vals)
                 model = sm.OLS(y_vals, X_sm).fit()
                 predictions = model.get_prediction(X_sm)
-                pred_df = predictions.summary_frame(alpha=0.05) # 95% Confidence Interval
+                pred_df = predictions.summary_frame(alpha=0.05)
                 
-                # Trendline
                 fig_q4.add_trace(go.Scatter(
                     x=x_vals, y=pred_df['mean'], mode='lines', name='Trend',
                     line=dict(color='royalblue', width=2)
                 ))
                 
-                # Confidence Band (Polygon connecting upper and lower bounds)
                 x_list = x_vals.tolist()
                 x_band = x_list + x_list[::-1]
-                
                 y_upper = pred_df['mean_ci_upper'].tolist()
                 y_lower = pred_df['mean_ci_lower'].tolist()
                 y_band = y_upper + y_lower[::-1]
@@ -788,7 +763,6 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
                 yaxis_title="Percentage of Property Crimes (%)",
                 hovermode="x unified"
             )
-
             st.plotly_chart(fig_q4, use_container_width=True)
         else:
             st.info("Missing specific columns: Could not map 'Property/רכוש' crime, 'quarter_name', or 'avg_chained_index_points' in the provided files.")
@@ -889,60 +863,25 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
 
     st.markdown("---")
 
-    # --- 7. SHARPEST CHANGE IN RATE ---
-    st.header("7. 📊 Cities with the Sharpest Change in Crime Rate (2020-2023)")
-    df_change = df_clean[df_clean['Year'].isin([2020, 2023])].copy()
-    change_agg = df_change.groupby(['Yeshuv', 'Year']).agg({'EventCount':'sum', 'Total_Population':'max'}).reset_index()
-    change_agg = change_agg[change_agg['Total_Population'] > 0]
-    change_agg['Rate'] = (change_agg['EventCount'] / change_agg['Total_Population']) * 1000
-    
-    pivot_change = change_agg.pivot(index='Yeshuv', columns='Year', values='Rate').dropna()
-    if 2020 in pivot_change.columns and 2023 in pivot_change.columns:
-        pivot_change['RateChange'] = pivot_change[2023] - pivot_change[2020]
-        top_inc = pivot_change.nlargest(5, 'RateChange').reset_index()
-        top_dec = pivot_change.nsmallest(5, 'RateChange').reset_index()
-        combined_change = pd.concat([top_inc, top_dec]).sort_values('RateChange')
-        
-        combined_change['Color'] = combined_change['RateChange'].apply(lambda x: 'Decrease (Green)' if x < 0 else 'Increase (Red)')
-        
-        fig_q6 = px.bar(
-            combined_change, x='RateChange', y='Yeshuv', orientation='h',
-            color='Color', color_discrete_map={'Decrease (Green)': 'green', 'Increase (Red)': 'red'},
-            title="Change in Crime Rate per 1,000 Residents (2020-2023)",
-            labels={'RateChange': 'Change in Crime Rate (Points)', 'Yeshuv': 'City', 'Color': 'Trend'},
-            text=combined_change['RateChange'].apply(lambda x: f"{x:+.0f}")
-        )
-        st.plotly_chart(fig_q6, use_container_width=True)
-    else:
-        st.info("Data for 2020 or 2023 is missing to calculate the change.")
-
-    st.markdown("---")
-
-    # --- 8. CRIME COMPOSITION BY DEMOGRAPHIC (BOXPLOT) ---
-    st.header("8. 📊 Correlation Observed Between Locality Demographic and Dominant Crime Profile")
+    # --- 7. CRIME COMPOSITION BY DEMOGRAPHIC (BOXPLOT) ---
+    st.header("7. 📊 Correlation Observed Between Locality Demographic and Dominant Crime Profile")
     st.markdown("Compares the distribution of crime types across individual cities, grouped by majority demographic (Boxplot shows median, quartiles, and outliers per city).")
 
     df_demo = df_filtered[df_filtered['Majority_Religion'].isin(['Jews & Others', 'Arabs'])].copy()
     if not df_demo.empty:
-        # Calculate crimes per city per category
         city_crime_type = df_demo.groupby(['Yeshuv', 'Majority_Religion', 'StatisticGroup'])['EventCount'].sum().reset_index()
-        
-        # Calculate total crimes per city
         city_total = df_demo.groupby('Yeshuv')['EventCount'].sum().reset_index().rename(columns={'EventCount': 'CityTotal'})
         
-        # Merge and calculate percentage
         city_comp = city_crime_type.merge(city_total, on='Yeshuv')
         city_comp = city_comp[city_comp['CityTotal'] > 0]
         city_comp['Percent'] = (city_comp['EventCount'] / city_comp['CityTotal']) * 100
         
-        # Get count of unique cities for context
         city_counts = city_comp[['Yeshuv', 'Majority_Religion']].drop_duplicates()['Majority_Religion'].value_counts()
         jews_count = city_counts.get('Jews & Others', 0)
         arabs_count = city_counts.get('Arabs', 0)
         
         st.info(f"💡 **Analysis Scope:** Unique localities included in this comparison: **{jews_count}** Jewish & Others localities, and **{arabs_count}** Arab localities.")
 
-        # Sort categories by overall median for better readability
         cat_order = city_comp.groupby('StatisticGroup')['Percent'].median().sort_values(ascending=False).index.tolist()
 
         fig_demo = px.box(
@@ -955,8 +894,8 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
             },
             category_orders={'StatisticGroup': cat_order},
             color_discrete_map={
-                'Jews & Others': px.colors.qualitative.Pastel[1], # פסטל תכלת
-                'Arabs': px.colors.qualitative.Pastel[4]          # פסטל כתום
+                'Jews & Others': px.colors.qualitative.Pastel[1],
+                'Arabs': px.colors.qualitative.Pastel[4]
             }
         )
         
@@ -967,8 +906,8 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
 
     st.markdown("---")
 
-    # --- 9. COVID AND WAR IMPACT ---
-    st.header("9. 🦠⚔️ Crime Distribution Across National Periods - Property crime shares were lower during emergencies compared to routine")
+    # --- 8. COVID AND WAR IMPACT ---
+    st.header("8. 🦠⚔️ Crime Distribution Across National Periods - Property crime shares were lower during emergencies compared to routine")
     def get_period(row):
         y = row.get('Year')
         q = row.get('Quarter', '')
@@ -983,15 +922,12 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
         q2_total = q2_df.groupby('Period')['EventCount'].transform('sum')
         q2_df['Percent'] = (q2_df['EventCount'] / q2_total) * 100
         
-        # Sort values to ensure lines draw correctly left-to-right based on period order
         period_order = ['COVID-19 Period', 'Routine', 'Iron Swords War']
         q2_df['Period'] = pd.Categorical(q2_df['Period'], categories=period_order, ordered=True)
         q2_df = q2_df.sort_values(['StatisticGroup', 'Period'])
 
-        # Filter out labels that are too small to prevent clutter, or format them cleanly
         q2_df['TextLabel'] = q2_df['Percent'].apply(lambda x: f"{x:.1f}%" if x >= 1 else "")
 
-        # Use a line chart (Slope Chart) instead of bar chart
         fig_q2 = px.line(
             q2_df, x='Period', y='Percent', color='StatisticGroup', markers=True,
             title="Crime Distribution Across Different National Periods (Slope Chart)",
@@ -1012,16 +948,16 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
         fig_q2.update_layout(
             xaxis_title="Time Period", 
             yaxis_title="Percentage of Total Crime (%)",
-            height=800  # Stretched the chart to spread out the lines and avoid overlap
+            height=800
         )
         st.plotly_chart(fig_q2, use_container_width=True)
 
     st.markdown("---")
 
-    # --- 10. SOCIO-ECONOMIC CORRELATION ---
+    # --- 9. SOCIO-ECONOMIC CORRELATION ---
     cluster_cols = [c for c in df_clean.columns if 'cluster' in c.lower() or 'socio' in c.lower() or 'אשכול' in c]
     if cluster_cols:
-        st.header("10. 🏙️ Correlation Between Socio-Economic Cluster and Crime Rate")
+        st.header("9. 🏙️ Correlation Between Socio-Economic Cluster and Crime Rate")
         cluster_col = cluster_cols[0]
         
         df_q5 = agg_avg.copy() if selected_year == "Average" else agg_yearly[agg_yearly['Year'] == selected_year].copy()
@@ -1043,7 +979,6 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
 
 # --- Main App Execution ---
 if __name__ == "__main__":
-    # Updated file extension to .csv.gz to handle compression
     final_crime_path = "merged_crime_population_final.csv.gz"
     cpi_path = "quarterly_cpi_chained.csv"
 
