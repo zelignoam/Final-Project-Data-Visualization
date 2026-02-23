@@ -4,10 +4,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pydeck as pdk
 import numpy as np
+import requests
+import re
 import sys
 import os
 
-# --- Static Data: Coordinates for Major Israeli Cities ---
+# ==========================================
+# STATIC DATA
+# ==========================================
 CITY_COORDINATES = {
     'ירושלים': [31.7683, 35.2137],
     'תל אביב - יפו': [32.0853, 34.7818],
@@ -87,6 +91,381 @@ CITY_COORDINATES = {
     'גדרה': [31.8125, 34.7780],
 }
 
+
+# ==========================================
+# DATA PIPELINE FUNCTIONS
+# ==========================================
+
+def load_crime_df():
+    resources = {
+        "2025": "e311b6a1-be5a-4a82-8298-f3afbee07b6b",
+        "2024": "5fc13c50-b6f3-4712-b831-a75e0f91a17e",
+        "2023": "32aacfc9-3524-4fba-a282-3af052380244",
+        "2022": "a59f3e9e-a7fe-4375-97d0-76cea68382c1",
+        "2021": "3f71fd16-25b8-4cfe-8661-e6199db3eb12",
+        "2020": "520597e3-6003-4247-9634-0ae85434b971"
+    }
+    all_dfs = []
+    for year, resource_id in resources.items():
+        print(f"loading {year}...")
+        url = f"https://data.gov.il/api/3/action/datastore_search"
+        limit = 50000
+        offset = 0
+        rows = []
+        while True:
+            resp = requests.get(url, params={"resource_id": resource_id, "limit": limit, "offset": offset})
+            data = resp.json()
+            batch = data["result"]["records"]
+            rows.extend(batch)
+            if len(batch) < limit:
+                break 
+            offset += limit
+        df = pd.DataFrame(rows)
+        all_dfs.append(df)
+
+    crime_df = pd.concat(all_dfs, ignore_index=True)
+    crime_df = crime_df.drop_duplicates()
+    return crime_df
+
+def clean_text_columns_regex(df, columns_to_clean):
+    df_cleaned = df.copy()
+    pattern = r'[^\w\s]|_'
+    print(f"--- Cleaning Text Columns: {columns_to_clean} ---")
+    for col in columns_to_clean:
+        if col in df_cleaned.columns:
+            df_cleaned[col] = df_cleaned[col].apply(
+                lambda x: re.sub(pattern, '', str(x)).strip() if pd.notna(x) else x
+            )
+        else:
+            print(f"Warning: Column '{col}' not found.")
+    return df_cleaned
+
+def strip_whitespace_columns(df, columns):
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    return df
+
+def impute_missing_names_from_codes(df, code_name_pairs):
+    df_out = df.copy()
+    print("--- Code-Based Imputation Report ---")
+    for code_col, name_col in code_name_pairs:
+        if code_col not in df_out.columns or name_col not in df_out.columns: continue
+        missing_before = df_out[name_col].isna().sum()
+        if missing_before == 0: continue
+        valid_rows = df_out.dropna(subset=[code_col, name_col])
+        if valid_rows.empty: continue
+
+        mapping_df = valid_rows[[code_col, name_col]].drop_duplicates(subset=[code_col])
+        mapping_dict = dict(zip(mapping_df[code_col], mapping_df[name_col]))
+        mask = df_out[name_col].isna() & df_out[code_col].notna()
+        df_out.loc[mask, name_col] = df_out.loc[mask, code_col].map(mapping_dict)
+        missing_after = df_out[name_col].isna().sum()
+        print(f"Column '{name_col}': Imputed {missing_before - missing_after} values using '{code_col}'. Remaining: {missing_after}")
+    return df_out
+
+def impute_fields_from_station_text(df, station_col, target_cols):
+    df_out = df.copy()
+    if station_col not in df_out.columns: return df_out
+    FORBIDDEN_VALUES = {'', ' ', 'מקום אחר', 'other', 'Other', 'לא ידוע', 'nan', 'None'}
+
+    for target_col in target_cols:
+        if target_col not in df_out.columns: continue
+        missing_before = df_out[target_col].isna().sum()
+        if missing_before == 0: continue
+
+        known_values = df_out[target_col].dropna().unique()
+        valid_candidates = [v for v in known_values if str(v).strip() not in FORBIDDEN_VALUES]
+        valid_candidates = sorted(valid_candidates, key=lambda x: len(str(x)), reverse=True)
+        if not valid_candidates: continue
+
+        mask = df_out[target_col].isna() & df_out[station_col].notna()
+        stations_to_check = df_out.loc[mask, station_col].unique()
+        mapping = {}
+        
+        for station in stations_to_check:
+            st_str = str(station)
+            for candidate in valid_candidates:
+                cand_str = str(candidate)
+                if cand_str in st_str:
+                    mapping[station] = candidate
+                    break 
+        
+        if mapping:
+            rows_to_fill = mask & df_out[station_col].isin(mapping.keys())
+            df_out.loc[rows_to_fill, target_col] = df_out.loc[rows_to_fill, station_col].map(mapping)
+    return df_out
+
+def impute_parent_from_child(df, child_col, parent_col):
+    df_out = df.copy()
+    if child_col not in df_out.columns or parent_col not in df_out.columns: return df_out
+    missing_before = df_out[parent_col].isna().sum()
+    if missing_before == 0: return df_out
+
+    valid_relations = df_out.dropna(subset=[child_col, parent_col])[[child_col, parent_col]].drop_duplicates()
+    valid_relations = valid_relations[~valid_relations[parent_col].astype(str).isin(['', ' ', 'מקום אחר', 'nan'])]
+    ambiguous_children = valid_relations[valid_relations.duplicated(subset=[child_col], keep=False)][child_col].unique()
+    
+    if len(ambiguous_children) > 0:
+        valid_relations = valid_relations[~valid_relations[child_col].isin(ambiguous_children)]
+    
+    mapping_dict = dict(zip(valid_relations[child_col], valid_relations[parent_col]))
+    mask = df_out[parent_col].isna() & df_out[child_col].notna()
+    df_out.loc[mask, parent_col] = df_out.loc[mask, child_col].map(mapping_dict)
+    return df_out
+
+def get_manual_code_mapping():
+    return {
+        "נהריה": 9100,
+        "קרית גת": 2630,
+        "גסר א זרקא": 541,
+        "נמל תעופה בן גוריון": 1748,
+    }
+
+def inject_manual_codes(df, city_col='Yeshuv', code_col='YeshuvCode'):
+    mapping = get_manual_code_mapping()
+    if code_col not in df.columns:
+        df[code_col] = np.nan
+    df = df.copy()
+    for city_name, code in mapping.items():
+        mask = (df[city_col] == city_name)
+        if mask.sum() > 0:
+            df.loc[mask, code_col] = code
+    return df
+
+def process_and_summarize_crime_data(df):
+    impute_pairs = [
+        ('municipalKod', 'municipalName'), ('YeshuvKod', 'Yeshuv'),
+        ('PoliceDistrictKod', 'PoliceDistrict'), ('PoliceMerhavKod', 'PoliceMerhav'),
+        ('StatisticAreaKod', 'StatisticArea'), ('StatisticGroupKod', 'StatisticGroup'),
+        ('StatisticTypeKod', 'StatisticType')
+    ]
+    
+    text_cols = [pair[1] for pair in impute_pairs] + ['PoliceStation'] 
+    text_cols = [c for c in text_cols if c in df.columns]
+    df_processed = clean_text_columns_regex(df, text_cols)
+    df_processed = impute_missing_names_from_codes(df_processed, impute_pairs)
+    
+    df_processed = impute_parent_from_child(df_processed, 'PoliceStation', 'Yeshuv')
+    text_mining_targets = ['Yeshuv', 'PoliceMerhav', 'PoliceDistrict', 'municipalName']
+    df_processed = impute_fields_from_station_text(df_processed, 'PoliceStation', text_mining_targets)
+    
+    remaining_steps = [('Yeshuv', 'PoliceMerhav'), ('Yeshuv', 'municipalName'), ('PoliceMerhav', 'PoliceDistrict')]
+    for child, parent in remaining_steps:
+        df_processed = impute_parent_from_child(df_processed, child, parent)
+
+    df_processed['QuarterYear']= df_processed['Quarter'] +'-'+ df_processed['Year'].astype(str)
+    
+    group_cols = ['Year', 'Quarter', 'QuarterYear', 'Yeshuv', 'YeshuvKod',
+                  'PoliceDistrict', 'PoliceMerhav', 'municipalName', 
+                  'StatisticArea', 'StatisticGroup', 'StatisticType']
+    valid_group_cols = [c for c in group_cols if c in df_processed.columns]
+    
+    df_for_agg = df_processed.copy()
+    for col in valid_group_cols:
+        df_for_agg[col] = df_for_agg[col].fillna('Missing')
+    
+    summary_df = df_for_agg.groupby(valid_group_cols)['FictiveIDNumber'].count().reset_index()
+    summary_df.rename(columns={'FictiveIDNumber': 'EventCount'}, inplace=True)
+    return summary_df, df_processed
+
+def fetch_population_data():
+    resources = {
+        2019: '990ae78e-2dae-4a15-a13b-0b5dcc56056c', 2020: '2d218594-73e3-40de-b36b-23b22f0a2627',
+        2021: '95435941-d7e5-46c6-876a-761a74a5928d', 2022: '199b15db-3bcb-470e-ba03-73364737e352',
+        2023: 'd47a54ff-87f0-44b3-b33a-f284c0c38e5a'
+    }
+    base_url = "https://data.gov.il/api/3/action/datastore_search"
+    pop_dfs = []
+    field_mapping = {
+        'Yeshuv_Code': 'סמל יישוב', 'Yeshuv_Name': 'שם יישוב',       
+        'Religion_Code': 'דת יישוב', 'Total_Population': 'סך הכל אוכלוסייה',
+        'Total_Israelis': 'סך הכל ישראלים', 'Jews_and_Others': 'יהודים ואחרים', 'Arabs': 'ערבים'
+    }
+
+    for year, resource_id in resources.items():
+        try:
+            response = requests.get(base_url, params={'resource_id': resource_id, 'limit': 5000})
+            data = response.json()
+            if data.get('success'):
+                records = data['result']['records']
+                df_temp = pd.DataFrame(records)
+                found_cols = {}
+                name_col = next((c for c in df_temp.columns if 'שם יישוב' in c and 'אנגלית' not in c), None)
+                if name_col: found_cols['Yeshuv_Name'] = name_col
+                
+                for eng_key, heb_search in field_mapping.items():
+                    if eng_key == 'Yeshuv_Name': continue 
+                    match = next((c for c in df_temp.columns if heb_search in c), None)
+                    if match: found_cols[eng_key] = match
+                
+                if 'Yeshuv_Code' in found_cols or 'Yeshuv_Name' in found_cols:
+                    rename_map = {v: k for k, v in found_cols.items()}
+                    df_clean = df_temp[list(found_cols.values())].rename(columns=rename_map).copy()
+                    df_clean['Year'] = year
+                    pop_dfs.append(df_clean)
+        except Exception as e:
+            print(f"Error fetching population data for {year}: {e}")
+
+    if pop_dfs: return pd.concat(pop_dfs, ignore_index=True)
+    return pd.DataFrame()
+
+def preprocess_population(df):
+    if df.empty: return df
+    df['Yeshuv_Code'] = pd.to_numeric(df['Yeshuv_Code'], errors='coerce')
+    df = strip_whitespace_columns(df, ['Yeshuv_Name'])
+    
+    numeric_cols = ['Total_Population', 'Total_Israelis', 'Jews_and_Others', 'Arabs', 'Religion_Code']
+    for col in numeric_cols:
+        if col in df.columns:
+            if df[col].dtype == object:
+                 df[col] = df[col].astype(str).str.replace(',', '')
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+def extrapolate_quarters(pop_df, years_of_interest):
+    expanded_data = []
+    valid_pop = pop_df.dropna(subset=['Yeshuv_Code']).copy()
+    
+    for yeshuv_code, group in valid_pop.groupby('Yeshuv_Code'):
+        group = group.sort_values('Year')
+        yeshuv_name = group['Yeshuv_Name'].iloc[0]
+        for year in years_of_interest:
+            current_row = group[group['Year'] == year]
+            if current_row.empty: continue
+            
+            curr_pop = current_row['Total_Population'].values[0]
+            if pd.isna(curr_pop): curr_pop = 0
+            
+            rel_code = current_row['Religion_Code'].values[0] if 'Religion_Code' in current_row else np.nan
+            israelis = current_row['Total_Israelis'].values[0] if 'Total_Israelis' in current_row else np.nan
+            jews = current_row['Jews_and_Others'].values[0] if 'Jews_and_Others' in current_row else np.nan
+            arabs = current_row['Arabs'].values[0] if 'Arabs' in current_row else np.nan
+
+            prev_row = group[group['Year'] == year - 1]
+            growth_calculated = False
+            if not prev_row.empty:
+                prev_pop = prev_row['Total_Population'].values[0]
+                if pd.notna(prev_pop):
+                    diff = curr_pop - prev_pop
+                    q_growth = diff / 4
+                    quarters = [prev_pop + q_growth, prev_pop + (q_growth*2), prev_pop + (q_growth*3), curr_pop]
+                    growth_calculated = True
+                    
+            if not growth_calculated: quarters = [curr_pop] * 4
+            
+            for q_idx, q_name in enumerate(['Q1', 'Q2', 'Q3', 'Q4']):
+                val = quarters[q_idx]
+                expanded_data.append({
+                    'Yeshuv_Code': yeshuv_code, 'Yeshuv_Name': yeshuv_name, 'Year': year, 'Quarter': q_name,
+                    'Total_Population': int(val) if pd.notna(val) else 0, 
+                    'Religion_Code': rel_code, 'Total_Israelis': israelis,
+                    'Jews_and_Others': jews, 'Arabs': arabs
+                })
+    return pd.DataFrame(expanded_data)
+
+def join_crime_population(crime_df_agg, pop_quarterly_df):
+    crime_df_clean = crime_df_agg.dropna(subset=['Yeshuv', 'Year']).copy()
+    crime_df_clean['Join_Key_Code'] = pd.to_numeric(crime_df_clean['YeshuvKod'], errors='coerce')
+    crime_df_clean['Join_Key_Name'] = crime_df_clean['Yeshuv'].astype(str).str.strip()
+    
+    merge_cols = ['Yeshuv_Code', 'Year', 'Quarter', 'Total_Population', 'Religion_Code', 
+                  'Total_Israelis', 'Jews_and_Others', 'Arabs']
+    available_cols = [c for c in merge_cols if c in pop_quarterly_df.columns]
+    
+    merged_df = pd.merge(
+        crime_df_clean, pop_quarterly_df[available_cols],
+        left_on=['Join_Key_Code', 'Year', 'Quarter'], right_on=['Yeshuv_Code', 'Year', 'Quarter'], how='left'
+    )
+    
+    name_merge_cols = ['Yeshuv_Name', 'Year', 'Quarter'] + [c for c in available_cols if c not in ['Yeshuv_Code', 'Year', 'Quarter']]
+    merged_with_name = pd.merge(
+        merged_df, pop_quarterly_df[name_merge_cols],
+        left_on=['Join_Key_Name', 'Year', 'Quarter'], right_on=['Yeshuv_Name', 'Year', 'Quarter'],
+        how='left', suffixes=('', '_NameFallback')
+    )
+    
+    target_fields = ['Total_Population', 'Religion_Code', 'Total_Israelis', 'Jews_and_Others', 'Arabs']
+    for col in target_fields:
+        fallback_col = f'{col}_NameFallback'
+        if fallback_col in merged_with_name.columns:
+             merged_with_name[col] = merged_with_name[col].fillna(merged_with_name[fallback_col])
+    
+    cols_to_drop = [c for c in merged_with_name.columns if 'Join_Key' in c or '_NameFallback' in c]
+    merged_final = merged_with_name.drop(columns=cols_to_drop, errors='ignore')
+
+    if 'Yeshuv' in merged_final.columns and 'Yeshuv_Name' in merged_final.columns:
+        merged_final['Yeshuv'] = merged_final['Yeshuv'].fillna(merged_final['Yeshuv_Name'])
+        merged_final.drop(columns=['Yeshuv_Name'], inplace=True)
+    if 'YeshuvKod' in merged_final.columns and 'Yeshuv_Code' in merged_final.columns:
+        merged_final['YeshuvKod'] = merged_final['YeshuvKod'].fillna(merged_final['Yeshuv_Code'])
+        merged_final.drop(columns=['Yeshuv_Code'], inplace=True)
+
+    return merged_final
+
+def get_chained_quarterly_cpi(start_year, end_year):
+    cpi_id = 120010
+    url = "https://api.cbs.gov.il/index/data/price"
+    params = {"id": cpi_id, "startPeriod": f"01-{start_year}", "endPeriod": f"12-{end_year}", "format": "json", "download": "false"}
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+        if 'month' not in data or not data['month']: return None
+
+        observations = data['month'][0].get('date', [])
+        records = []
+        for obs in observations:
+            pct_change = obs.get('percent')
+            if pct_change is not None:
+                records.append({'date': f"{obs['year']}-{obs['month']:02d}-01", 'monthly_percent_change': float(pct_change)})
+        
+        df = pd.DataFrame(records)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+        df['chained_index'] = 100.0
+        
+        for i in range(1, len(df)):
+            df.loc[i, 'chained_index'] = df.loc[i-1, 'chained_index'] * (1 + df.loc[i, 'monthly_percent_change'] / 100)
+
+        quarterly_df = df.set_index('date').resample('Q').agg({
+            'chained_index': 'mean', 'monthly_percent_change': 'sum'
+        }).reset_index()
+        
+        quarterly_df['quarter_name'] = quarterly_df['date'].dt.to_period('Q')
+        quarterly_df = quarterly_df.rename(columns={'chained_index': 'avg_chained_index_points', 'monthly_percent_change': 'total_quarterly_inflation_pct'})
+        return quarterly_df[['quarter_name', 'avg_chained_index_points', 'total_quarterly_inflation_pct']]
+    except Exception as e:
+        print(f"Error fetching CPI: {e}")
+        return None
+
+def run_data_pipeline(final_crime_path, cpi_path):
+    print("Initiating Pipeline...")
+    
+    # 1. Fetch & Process Crime Data
+    crime_df = load_crime_df()
+    crime_df_agg, _ = process_and_summarize_crime_data(crime_df)
+
+    # 2. Fetch & Process Pop Data
+    pop_raw = fetch_population_data()
+    pop_clean = preprocess_population(pop_raw)
+    pop_quarterly = extrapolate_quarters(pop_clean, years_of_interest=[2020, 2021, 2022, 2023])
+
+    # 3. Merge & Save
+    if not pop_quarterly.empty and crime_df_agg is not None:
+        final_df = join_crime_population(crime_df_agg, pop_quarterly)
+        final_df.to_csv(final_crime_path, index=False, encoding='utf-8-sig')
+
+    # 4. Fetch & Save CPI
+    cpi_df = get_chained_quarterly_cpi(2020, 2025)
+    if cpi_df is not None:
+        cpi_df.to_csv(cpi_path, index=False, encoding='utf-8-sig')
+    print("Pipeline Complete!")
+
+
+# ==========================================
+# DASHBOARD FUNCTIONS
+# ==========================================
+
 def determine_majority_religion(df):
     """
     Attempts to determine the majority religion per row based on exact column names provided.
@@ -96,11 +475,9 @@ def determine_majority_religion(df):
     existing_cols = [col for col in potential_cols if col in df.columns]
     
     if len(existing_cols) >= 2:
-        # Strip commas from numbers (e.g., "45,000" -> "45000") and convert to numeric
         temp_df = df[existing_cols].replace({',': ''}, regex=True).apply(pd.to_numeric, errors='coerce').fillna(0)
         majority = temp_df.idxmax(axis=1)
         
-        # Map Hebrew/Raw names to clean English labels for the dashboard
         name_mapping = {
             'יהודים ואחרים': 'Jews & Others',
             'Jews_and_Others': 'Jews & Others',
@@ -112,6 +489,26 @@ def determine_majority_religion(df):
         df['Majority_Religion'] = 'Data Not Available'
         
     return df
+
+@st.cache_data(show_spinner=False)
+def load_cloud_ready_data(crime_path, cpi_path):
+    """
+    Cloud-optimized data loader. 
+    Checks if files exist. If yes, loads them. 
+    If no, safely executes the pipeline, caches the result in memory, and saves locally.
+    """
+    if not os.path.exists(crime_path) or not os.path.exists(cpi_path):
+        # Files are missing (common on first cloud boot if CSVs aren't in the repo)
+        run_data_pipeline(crime_path, cpi_path)
+        
+    # Read the files (either pre-existing or just generated)
+    df = pd.read_csv(crime_path, low_memory=False)
+    try:
+        cpi_df = pd.read_csv(cpi_path)
+    except FileNotFoundError:
+        cpi_df = None
+        
+    return df, cpi_df
 
 def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
     st.set_page_config(page_title="Israel Crime Stats", layout="wide")
@@ -213,7 +610,7 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
     st.markdown("---")
 
     # ==========================================
-    # VISUALIZATIONS (REORDERED)
+    # VISUALIZATIONS
     # ==========================================
 
     # --- 1. TREEMAP: NATIONAL CRIME COMPOSITION ---
@@ -641,29 +1038,30 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
 
 # --- Boilerplate to run standalone ---
 if __name__ == "__main__":
-    if st.runtime.exists():
-        # Update paths based on your actual local directories
-        csv_path = "/Users/noamzelig/Desktop/Noam/Visualization_course/final_project/merged_crime_population_final.csv"
-        cpi_path = "/Users/noamzelig/Desktop/Noam/Visualization_course/final_project/quarterly_cpi_chained.csv"
-        
-        try:
-            df = pd.read_csv(csv_path, low_memory=False)
-            print(f"\n[INFO] Crime CSV loaded. Shape: {df.shape}")
-            
-            try:
-                cpi_df = pd.read_csv(cpi_path)
-                print(f"[INFO] CPI CSV loaded. Shape: {cpi_df.shape}\n")
-            except FileNotFoundError:
-                cpi_df = None
-                print(f"[WARNING] CPI CSV not found at: {cpi_path}\n")
+    # Define primary local files for the app to interact with
+    final_crime_path = "merged_crime_population_final.csv"
+    cpi_path = "quarterly_cpi_chained.csv"
 
-            visualize_crime_rates_streamlit(df, cpi_df)
-        except FileNotFoundError:
-            st.error(f"Please ensure the primary file exists at: {csv_path}")
+    if st.runtime.exists():
+        # Running inside Streamlit
+        if not os.path.exists(final_crime_path) or not os.path.exists(cpi_path):
+            st.warning("⚠️ Raw data files not found. Initiating automated Data Pipeline to fetch from APIs. This may take a few minutes...")
+            
+        with st.spinner("Loading and processing dashboard data..."):
+            try:
+                df, cpi_df = load_cloud_ready_data(final_crime_path, cpi_path)
+                visualize_crime_rates_streamlit(df, cpi_df)
+            except Exception as e:
+                st.error(f"Critical error loading data: {e}")
+                
     else:
+        # Running in terminal
         print("------------------------------------------------------------------")
         print("⚠️  STREAMLIT NOT DETECTED")
-        print("   To view the interactive dashboard, you must run this script via the Streamlit CLI.")
-        print("   Please run the following command in your terminal:")
-        print(f"\n   streamlit run {os.path.basename(__file__) if '__file__' in locals() else 'crime_visualization.py'}")
-        print("\n------------------------------------------------------------------")
+        print("   To view the interactive dashboard, run this script via Streamlit CLI:")
+        print(f"   $ streamlit run {os.path.basename(__file__) if '__file__' in locals() else 'crime_visualization.py'}")
+        print("\n   [Optional] Do you want to run the background Data Pipeline anyway? (Downloading APIs, merging, cleaning)")
+        user_input = input("   Type 'y' to run pipeline, or 'n' to exit: ").strip().lower()
+        if user_input == 'y':
+            run_data_pipeline(final_crime_path, cpi_path)
+        print("------------------------------------------------------------------")
