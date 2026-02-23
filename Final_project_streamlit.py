@@ -457,10 +457,10 @@ def run_data_pipeline(final_crime_path, cpi_path):
     pop_clean = preprocess_population(pop_raw)
     pop_quarterly = extrapolate_quarters(pop_clean, years_of_interest=[2020, 2021, 2022, 2023])
 
-    # 3. Merge & Save
+    # 3. Merge & Save as GZIP compressed CSV
     if not pop_quarterly.empty and crime_df_agg is not None:
         final_df = join_crime_population(crime_df_agg, pop_quarterly)
-        final_df.to_csv(final_crime_path, index=False, encoding='utf-8-sig')
+        final_df.to_csv(final_crime_path, index=False, encoding='utf-8-sig', compression='gzip')
 
     # 4. Fetch & Save CPI
     cpi_df = get_chained_quarterly_cpi(2020, 2025)
@@ -507,7 +507,8 @@ def load_cloud_ready_data(crime_path, cpi_path):
     if not os.path.exists(crime_path) or not os.path.exists(cpi_path):
         run_data_pipeline(crime_path, cpi_path)
         
-    df = pd.read_csv(crime_path, low_memory=False)
+    # Pandas natively handles '.gz' compression automatically!
+    df = pd.read_csv(crime_path, low_memory=False, compression='gzip')
     try:
         cpi_df = pd.read_csv(cpi_path)
     except FileNotFoundError:
@@ -1042,7 +1043,8 @@ def visualize_crime_rates_streamlit(merged_df, cpi_df=None):
 
 # --- Main App Execution ---
 if __name__ == "__main__":
-    final_crime_path = "merged_crime_population_final.csv"
+    # Updated file extension to .csv.gz to handle compression
+    final_crime_path = "merged_crime_population_final.csv.gz"
     cpi_path = "quarterly_cpi_chained.csv"
 
     try:
