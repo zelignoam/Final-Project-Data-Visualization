@@ -105,8 +105,6 @@ CITY_COORDINATES = {
 
 def load_crime_df():
     resources = {
-        "2025": "e311b6a1-be5a-4a82-8298-f3afbee07b6b",
-        "2024": "5fc13c50-b6f3-4712-b831-a75e0f91a17e",
         "2023": "32aacfc9-3524-4fba-a282-3af052380244",
         "2022": "a59f3e9e-a7fe-4375-97d0-76cea68382c1",
         "2021": "3f71fd16-25b8-4cfe-8661-e6199db3eb12",
@@ -1008,4 +1006,3 @@ if __name__ == "__main__":
         if user_input == 'y':
             run_data_pipeline(final_crime_path, cpi_path)
         print("------------------------------------------------------------------")
-        
